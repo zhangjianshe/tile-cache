@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tile Cache Dashboard</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font:14px system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1180px;margin:auto;padding:32px 24px}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:24px}h1{margin:0;font-size:28px}.sub{color:#64748b;margin-top:6px}.status{color:#64748b}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:20px}.card,.panel{background:#fff;border:1px solid #dbe4f0;border-radius:8px;padding:20px;box-shadow:0 2px 8px #1720330a}.label{color:#64748b}.value{font-size:30px;font-weight:650;margin-top:10px}.panel h2{margin:0 0 18px;font-size:18px}.chart{height:260px;display:flex;align-items:end;gap:5px;border-bottom:1px solid #dbe4f0;padding-top:20px}.bar-wrap{flex:1;min-width:0;height:100%;display:flex;align-items:end;gap:1px;position:relative}.bar{min-height:1px;flex:1;border-radius:3px 3px 0 0}.read{background:#3b82f6}.write{background:#22c55e}.bar-wrap:hover:after{content:attr(data-tip);position:absolute;bottom:100%;left:50%;transform:translateX(-50%);white-space:nowrap;background:#172033;color:#fff;padding:6px 8px;border-radius:4px;font-size:12px;z-index:2}.axis{display:flex;gap:5px;margin-top:8px;color:#64748b;font-size:11px}.axis span{flex:1;text-align:center}.legend{display:flex;gap:18px;margin-top:16px;color:#64748b}.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px}.error{color:#dc2626}@media(max-width:960px){.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:700px){.cards{grid-template-columns:1fr}.wrap{padding:20px 12px}.chart{height:210px}}
+  </style>
+</head>
+<body><main class="wrap">
+  <header><div><h1>Tile Cache</h1><div class="sub">瓦片数据库运行概览</div></div><div id="status" class="status">正在加载…</div></header>
+  <section class="cards">
+    <div class="card"><div class="label">数据库数量</div><div id="databases" class="value">—</div></div>
+    <div class="card"><div class="label">磁盘占用</div><div id="disk" class="value">—</div></div>
+    <div class="card"><div class="label">内存占用</div><div id="memory" class="value">—</div></div>
+    <div class="card"><div class="label">线程数</div><div id="threads" class="value">—</div></div>
+    <div class="card"><div class="label">最近 24 小时访问</div><div id="requests" class="value">—</div></div>
+  </section>
+  <section class="panel"><h2>每小时访问统计</h2><div id="chart" class="chart"></div><div id="axis" class="axis"></div><div class="legend"><span><i class="dot read"></i>GET 请求</span><span><i class="dot write"></i>PUT 请求</span></div></section>
+</main><script>
+const api='/api/v1/dashboard';
+const databases=document.getElementById('databases'),disk=document.getElementById('disk'),memory=document.getElementById('memory'),threads=document.getElementById('threads'),requests=document.getElementById('requests'),chart=document.getElementById('chart'),axis=document.getElementById('axis'),statusEl=document.getElementById('status');
+const size=n=>{const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`};
+async function load(){try{const r=await fetch(api);if(!r.ok)throw new Error(r.status===401?'Token 无效或缺失':`HTTP ${r.status}`);const d=await r.json();
+  databases.textContent=d.database_count.toLocaleString();disk.textContent=size(d.disk_bytes);memory.textContent=size(d.memory_bytes);threads.textContent=d.thread_count.toLocaleString();
+  requests.textContent=d.hourly.reduce((n,h)=>n+h.get_requests+h.put_requests,0).toLocaleString();
+  const max=Math.max(1,...d.hourly.map(h=>h.get_requests+h.put_requests));chart.innerHTML='';axis.innerHTML='';
+  d.hourly.forEach((h,i)=>{const total=h.get_requests+h.put_requests,w=document.createElement('div');w.className='bar-wrap';w.dataset.tip=`GET ${h.get_requests} · PUT ${h.put_requests} · 命中 ${h.hits} · 未命中 ${h.misses} · 读取 ${size(h.bytes_read)} · 写入 ${size(h.bytes_written)}`;
+    for(const [v,c] of [[h.get_requests,'read'],[h.put_requests,'write']]){const b=document.createElement('i');b.className='bar '+c;b.style.height=(v/max*100)+'%';w.appendChild(b)}chart.appendChild(w);
+    const s=document.createElement('span'),date=new Date(h.hour_epoch*1000);s.textContent=i%3===0?String(date.getHours()).padStart(2,'0')+':00':'';axis.appendChild(s)});
+  statusEl.className='status';statusEl.textContent='更新于 '+new Date().toLocaleTimeString();
+}catch(e){statusEl.className='status error';statusEl.textContent=e.message}}
+load();setInterval(load,30000);
+</script></body></html>
