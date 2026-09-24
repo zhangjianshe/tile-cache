@@ -1,3 +1,4 @@
+use crate::model::{CleanupHistoryEntry, CleanupRun, CleanupSettings, NewCleanupHistory, Page};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{
@@ -13,6 +14,7 @@ use std::{
 };
 
 const RETAIN_HOURS: u64 = 24 * 90;
+const CLEANUP_HISTORY_RETENTION_SECONDS: u64 = 90 * 86_400;
 
 #[derive(Clone)]
 pub struct AccessStats {
@@ -69,6 +71,16 @@ impl AccessStats {
         sqlx::query("CREATE TABLE IF NOT EXISTS hourly_metrics(hour_epoch INTEGER PRIMARY KEY,get_requests INTEGER NOT NULL DEFAULT 0,put_requests INTEGER NOT NULL DEFAULT 0,hits INTEGER NOT NULL DEFAULT 0,misses INTEGER NOT NULL DEFAULT 0,bytes_read INTEGER NOT NULL DEFAULT 0,bytes_written INTEGER NOT NULL DEFAULT 0)")
             .execute(&database)
             .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS service_settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL)")
+            .execute(&database)
+            .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS cleanup_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,completed_at INTEGER NOT NULL,retention_days INTEGER NOT NULL,deleted_databases INTEGER NOT NULL,error TEXT)")
+            .execute(&database)
+            .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS cleanup_history(id INTEGER PRIMARY KEY AUTOINCREMENT,completed_at INTEGER NOT NULL,operation TEXT NOT NULL,database_id TEXT NOT NULL,database_name TEXT NOT NULL DEFAULT '',item_id TEXT,item_name TEXT,layer_count INTEGER NOT NULL DEFAULT 0,tile_count INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL DEFAULT 0,actor TEXT NOT NULL,success INTEGER NOT NULL,error TEXT)")
+            .execute(&database).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_cleanup_history_completed ON cleanup_history(completed_at DESC,id DESC)")
+            .execute(&database).await?;
         let oldest = current_hour().saturating_sub(RETAIN_HOURS);
         let rows = sqlx::query("SELECT hour_epoch,get_requests,put_requests,hits,misses,bytes_read,bytes_written FROM hourly_metrics WHERE hour_epoch>=? ORDER BY hour_epoch")
             .bind(oldest as i64)
@@ -140,6 +152,123 @@ impl AccessStats {
                 }
             })
             .collect()
+    }
+
+    pub async fn load_cleanup_settings(
+        &self,
+        defaults: CleanupSettings,
+    ) -> Result<CleanupSettings> {
+        let rows = sqlx::query("SELECT key,value FROM service_settings")
+            .fetch_all(&self.inner.database)
+            .await?;
+        let mut settings = defaults;
+        for row in rows {
+            let key: String = row.get(0);
+            let value = row.get::<i64, _>(1).max(0) as u64;
+            match key.as_str() {
+                "retention_days" => settings.retention_days = value,
+                "cleanup_hour" => settings.cleanup_hour = value.min(23) as u8,
+                "shard_idle_seconds" => settings.shard_idle_seconds = value,
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    pub async fn save_cleanup_settings(&self, settings: &CleanupSettings) -> Result<()> {
+        let mut transaction = self.inner.database.begin().await?;
+        for (key, value) in [
+            ("retention_days", settings.retention_days),
+            ("cleanup_hour", settings.cleanup_hour as u64),
+            ("shard_idle_seconds", settings.shard_idle_seconds),
+        ] {
+            sqlx::query("INSERT INTO service_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(key)
+                .bind(value as i64)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_cleanup(&self, run: &CleanupRun) -> Result<()> {
+        sqlx::query("INSERT INTO cleanup_runs(completed_at,retention_days,deleted_databases,error) VALUES(?,?,?,?)")
+            .bind(run.completed_at.unwrap_or_default() as i64)
+            .bind(run.retention_days as i64)
+            .bind(run.deleted_databases as i64)
+            .bind(&run.error)
+            .execute(&self.inner.database)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn last_cleanup(&self) -> Result<Option<CleanupRun>> {
+        let row = sqlx::query("SELECT completed_at,retention_days,deleted_databases,error FROM cleanup_runs ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&self.inner.database)
+            .await?;
+        Ok(row.map(|row| CleanupRun {
+            completed_at: Some(row.get::<i64, _>(0).max(0) as u64),
+            retention_days: row.get::<i64, _>(1).max(0) as u64,
+            deleted_databases: row.get::<i64, _>(2).max(0) as u64,
+            error: row.get(3),
+        }))
+    }
+
+    pub async fn record_cleanup_history(&self, entry: &NewCleanupHistory) -> Result<()> {
+        let mut transaction = self.inner.database.begin().await?;
+        sqlx::query("INSERT INTO cleanup_history(completed_at,operation,database_id,database_name,item_id,item_name,layer_count,tile_count,bytes,actor,success,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(entry.completed_at as i64).bind(&entry.operation).bind(&entry.database_id)
+            .bind(&entry.database_name).bind(&entry.item_id).bind(&entry.item_name)
+            .bind(entry.layer_count as i64).bind(entry.tile_count as i64).bind(entry.bytes as i64)
+            .bind(&entry.actor).bind(i64::from(entry.success)).bind(&entry.error)
+            .execute(&mut *transaction).await?;
+        let cutoff = entry
+            .completed_at
+            .saturating_sub(CLEANUP_HISTORY_RETENTION_SECONDS);
+        sqlx::query("DELETE FROM cleanup_history WHERE completed_at<?")
+            .bind(cutoff as i64)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_history(
+        &self,
+        page: u64,
+        page_size: u64,
+    ) -> Result<Page<CleanupHistoryEntry>> {
+        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cleanup_history")
+            .fetch_one(&self.inner.database)
+            .await?
+            .max(0) as u64;
+        let rows = sqlx::query("SELECT id,completed_at,operation,database_id,database_name,item_id,item_name,layer_count,tile_count,bytes,actor,success,error FROM cleanup_history ORDER BY completed_at DESC,id DESC LIMIT ? OFFSET ?")
+            .bind(page_size as i64).bind(((page - 1) * page_size) as i64)
+            .fetch_all(&self.inner.database).await?;
+        Ok(Page {
+            items: rows
+                .into_iter()
+                .map(|row| CleanupHistoryEntry {
+                    id: row.get(0),
+                    completed_at: row.get::<i64, _>(1).max(0) as u64,
+                    operation: row.get(2),
+                    database_id: row.get(3),
+                    database_name: row.get(4),
+                    item_id: row.get(5),
+                    item_name: row.get(6),
+                    layer_count: row.get::<i64, _>(7).max(0) as u64,
+                    tile_count: row.get::<i64, _>(8).max(0) as u64,
+                    bytes: row.get::<i64, _>(9).max(0) as u64,
+                    actor: row.get(10),
+                    success: row.get::<i64, _>(11) != 0,
+                    error: row.get(12),
+                })
+                .collect(),
+            page,
+            page_size,
+            total,
+        })
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -244,5 +373,73 @@ mod tests {
         assert_eq!(current.put_requests, 1);
         assert_eq!(current.bytes_read, 12);
         assert_eq!(current.bytes_written, 34);
+    }
+
+    #[tokio::test]
+    async fn persists_cleanup_settings_and_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let stats = AccessStats::open(directory.path()).await.unwrap();
+        let settings = CleanupSettings {
+            retention_days: 14,
+            cleanup_hour: 3,
+            shard_idle_seconds: 180,
+        };
+        stats.save_cleanup_settings(&settings).await.unwrap();
+        stats
+            .record_cleanup(&CleanupRun {
+                completed_at: Some(1234),
+                retention_days: 14,
+                deleted_databases: 2,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let restored = stats
+            .load_cleanup_settings(CleanupSettings {
+                retention_days: 7,
+                cleanup_hour: 4,
+                shard_idle_seconds: 300,
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored.retention_days, 14);
+        assert_eq!(restored.cleanup_hour, 3);
+        assert_eq!(restored.shard_idle_seconds, 180);
+        let run = stats.last_cleanup().await.unwrap().unwrap();
+        assert_eq!(run.completed_at, Some(1234));
+        assert_eq!(run.deleted_databases, 2);
+    }
+
+    #[tokio::test]
+    async fn persists_and_pages_cleanup_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let stats = AccessStats::open(directory.path()).await.unwrap();
+        stats
+            .record_cleanup_history(&NewCleanupHistory {
+                completed_at: 2_000_000_000,
+                operation: "delete_layer".into(),
+                database_id: "database-id".into(),
+                database_name: "测试数据库".into(),
+                item_id: Some("layer-id".into()),
+                item_name: Some("测试图层".into()),
+                layer_count: 1,
+                tile_count: 42,
+                bytes: 4096,
+                actor: "administrator".into(),
+                success: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        drop(stats);
+
+        let restored = AccessStats::open(directory.path()).await.unwrap();
+        let page = restored.cleanup_history(1, 20).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].database_name, "测试数据库");
+        assert_eq!(page.items[0].item_name.as_deref(), Some("测试图层"));
+        assert_eq!(page.items[0].tile_count, 42);
+        assert_eq!(page.items[0].bytes, 4096);
     }
 }

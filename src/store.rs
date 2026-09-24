@@ -8,11 +8,11 @@ use sqlx::{
     Connection, Row, SqliteConnection, SqlitePool,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
@@ -35,6 +35,7 @@ struct StoreInner {
 struct Shard {
     reads: SqlitePool,
     writes: mpsc::Sender<WriteCommand>,
+    last_used: std::sync::Mutex<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,12 @@ struct TileAddress {
     id: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PutOutcome {
+    pub created: bool,
+    pub requires_recalculation: bool,
+}
+
 enum WriteCommand {
     Put {
         table: String,
@@ -62,7 +69,7 @@ enum WriteCommand {
         x: i64,
         y: i64,
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<PutOutcome>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -85,11 +92,18 @@ impl TileStore {
         })
     }
 
+    pub fn database_path(&self, database: &str) -> Result<String, ApiError> {
+        Ok(database_directory(&self.inner.root, database)?
+            .to_string_lossy()
+            .into_owned())
+    }
+
     pub async fn get(&self, key: TileKey) -> Result<Option<Vec<u8>>, ApiError> {
         let address = tile_address(&self.inner.root, &key)?;
         let Some(shard) = self.shard(&address.shard_file, false).await? else {
             return Ok(None);
         };
+        shard.touch();
         if !table_exists(&shard.reads, &address.table).await? {
             return Ok(None);
         }
@@ -107,7 +121,7 @@ impl TileStore {
         Ok(data)
     }
 
-    pub async fn put(&self, key: TileKey, data: Vec<u8>) -> Result<(), ApiError> {
+    pub async fn put(&self, key: TileKey, data: Vec<u8>) -> Result<PutOutcome, ApiError> {
         if data.is_empty() {
             return Err(ApiError::Invalid(
                 "empty tile data is not allowed".to_owned(),
@@ -119,6 +133,7 @@ impl TileStore {
             .shard(&address.shard_file, true)
             .await?
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("tile shard was not created")))?;
+        shard.touch();
         let (reply, response) = oneshot::channel();
         shard
             .writes
@@ -131,13 +146,33 @@ impl TileStore {
                 reply,
             })
             .map_err(|_| ApiError::Overloaded)?;
-        response
+        let outcome = response
             .await
             .map_err(|_| writer_stopped())?
             .map_err(ApiError::Internal)?;
         self.touch_database(&key.database, &address.database_dir)
             .await;
-        Ok(())
+        Ok(outcome)
+    }
+
+    pub async fn put_batch(
+        &self,
+        writes: Vec<(TileKey, Vec<u8>)>,
+    ) -> Result<Vec<(TileKey, usize, PutOutcome)>, ApiError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (key, data) in writes {
+            let store = self.clone();
+            tasks.spawn(async move {
+                let bytes = data.len();
+                let outcome = store.put(key.clone(), data).await?;
+                Result::<_, ApiError>::Ok((key, bytes, outcome))
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.map_err(|error| ApiError::Internal(error.into()))??);
+        }
+        Ok(results)
     }
 
     pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, ApiError> {
@@ -189,6 +224,13 @@ impl TileStore {
                 let shard_files = list_shard_files(&item.path()).await?;
                 let mut tile_count = 0;
                 let mut total_bytes = 0;
+                let mut format = None;
+                let mut min_zoom = None;
+                let mut max_zoom = None;
+                let mut min_x = None;
+                let mut max_x = None;
+                let mut min_y = None;
+                let mut max_y = None;
                 for shard_file in shard_files {
                     let Some(shard) = self.shard(&shard_file, false).await? else {
                         continue;
@@ -199,20 +241,57 @@ impl TileStore {
                     .fetch_all(&shard.reads)
                     .await?;
                     for raw_table in tables {
+                        let Some(zoom) = table_zoom(&raw_table) else {
+                            continue;
+                        };
                         let table = quote_identifier(&raw_table)?;
                         let row = sqlx::query(&format!(
-                            "SELECT COUNT(*),COALESCE(SUM(F),0) FROM {table}"
+                            "SELECT COUNT(*),COALESCE(SUM(F),0),MIN(X),MAX(X),MIN(Y),MAX(Y) FROM {table}"
                         ))
                         .fetch_one(&shard.reads)
                         .await?;
-                        tile_count += row.get::<i64, _>(0);
+                        let count = row.get::<i64, _>(0);
+                        tile_count += count;
                         total_bytes += row.get::<i64, _>(1);
+                        if count == 0 {
+                            continue;
+                        }
+                        min_zoom = Some(min_zoom.map_or(zoom, |value: i64| value.min(zoom)));
+                        if max_zoom.is_none_or(|value| zoom > value) {
+                            max_zoom = Some(zoom);
+                            min_x = row.get::<Option<i64>, _>(2);
+                            max_x = row.get::<Option<i64>, _>(3);
+                            min_y = row.get::<Option<i64>, _>(4);
+                            max_y = row.get::<Option<i64>, _>(5);
+                        } else if max_zoom == Some(zoom) {
+                            min_x = merge_min(min_x, row.get::<Option<i64>, _>(2));
+                            max_x = merge_max(max_x, row.get::<Option<i64>, _>(3));
+                            min_y = merge_min(min_y, row.get::<Option<i64>, _>(4));
+                            max_y = merge_max(max_y, row.get::<Option<i64>, _>(5));
+                        }
+                        if format.is_none() {
+                            let sample = sqlx::query_scalar::<_, Vec<u8>>(&format!(
+                                "SELECT Data FROM {table} WHERE length(Data)>0 LIMIT 1"
+                            ))
+                            .fetch_optional(&shard.reads)
+                            .await?;
+                            format = sample.as_deref().map(tile_format);
+                        }
                     }
                 }
                 result.push(TilesetInfo {
                     item: item_id,
+                    name: String::new(),
                     tile_count,
                     total_bytes,
+                    format: format.unwrap_or("pbf").to_owned(),
+                    min_zoom,
+                    max_zoom,
+                    min_x,
+                    max_x,
+                    min_y,
+                    max_y,
+                    revocable: true,
                 });
             }
         }
@@ -244,22 +323,53 @@ impl TileStore {
         Ok(1)
     }
 
-    pub async fn cleanup(&self, cutoff: SystemTime) -> Result<u64, ApiError> {
+    pub async fn cleanup_candidates(
+        &self,
+        cutoff: SystemTime,
+    ) -> Result<Vec<DatabaseInfo>, ApiError> {
         let cutoff_epoch = epoch_seconds(cutoff).unwrap_or(0);
-        let mut deleted = 0;
-        for database in self.list_databases().await? {
-            if database
-                .modified_at
-                .is_some_and(|modified| modified < cutoff_epoch)
-            {
-                deleted += self.drop_database(&database.database).await?;
-            }
+        Ok(self
+            .list_databases()
+            .await?
+            .into_iter()
+            .filter(|database| {
+                database
+                    .modified_at
+                    .is_some_and(|modified| modified < cutoff_epoch)
+            })
+            .collect())
+    }
+
+    pub async fn close_idle_shards(&self, idle_timeout: Duration) -> usize {
+        let removed = {
+            let mut shards = self.inner.shards.write().await;
+            let paths = shards
+                .iter()
+                .filter(|(_, shard)| {
+                    Arc::strong_count(shard) == 1 && shard.idle_for() >= idle_timeout
+                })
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            paths
+                .into_iter()
+                .filter_map(|path| shards.remove(&path))
+                .collect::<Vec<_>>()
+        };
+        let count = removed.len();
+        for shard in removed {
+            close_shard(shard).await;
         }
-        Ok(deleted)
+        count
     }
 
     async fn shard(&self, path: &Path, create: bool) -> Result<Option<Arc<Shard>>, ApiError> {
         if let Some(shard) = self.inner.shards.read().await.get(path).cloned() {
+            return Ok(Some(shard));
+        }
+        // Serialize first-open for a path. Without the second check under the write lock,
+        // concurrent first PUTs can create multiple SQLite writers for the same shard.
+        let mut shards = self.inner.shards.write().await;
+        if let Some(shard) = shards.get(path).cloned() {
             return Ok(Some(shard));
         }
         if !create && tokio::fs::metadata(path).await.is_err() {
@@ -268,19 +378,28 @@ impl TileStore {
         if create {
             tokio::fs::create_dir_all(path.parent().expect("shard has parent")).await?;
         }
-        let shard = Arc::new(
-            open_shard(
+        let mut attempts = 0;
+        let shard = loop {
+            attempts += 1;
+            match open_shard(
                 path,
                 create,
                 self.inner.read_connections,
                 self.inner.queue_capacity,
             )
-            .await?,
-        );
-        let mut shards = self.inner.shards.write().await;
-        Ok(Some(
-            shards.entry(path.to_path_buf()).or_insert(shard).clone(),
-        ))
+            .await
+            {
+                Ok(shard) => break Arc::new(shard),
+                Err(error)
+                    if attempts < 4 && format!("{error:?}").contains("database is locked") =>
+                {
+                    tokio::time::sleep(Duration::from_millis(2 * attempts)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        shards.insert(path.to_path_buf(), shard.clone());
+        Ok(Some(shard))
     }
 
     async fn close_shards_under(&self, directory: &Path) {
@@ -297,10 +416,7 @@ impl TileStore {
                 .collect::<Vec<_>>()
         };
         for shard in removed {
-            let (reply, response) = oneshot::channel();
-            let _ = shard.writes.send(WriteCommand::Shutdown { reply }).await;
-            let _ = response.await;
-            shard.reads.close().await;
+            close_shard(shard).await;
         }
     }
 
@@ -340,49 +456,167 @@ async fn open_shard(
         .await?;
     let (writes, receiver) = mpsc::channel(queue_capacity);
     tokio::spawn(writer_loop(writer, receiver));
-    Ok(Shard { reads, writes })
+    Ok(Shard {
+        reads,
+        writes,
+        last_used: std::sync::Mutex::new(Instant::now()),
+    })
+}
+
+impl Shard {
+    fn touch(&self) {
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+    }
+}
+
+async fn close_shard(shard: Arc<Shard>) {
+    let (reply, response) = oneshot::channel();
+    let _ = shard.writes.send(WriteCommand::Shutdown { reply }).await;
+    let _ = response.await;
+    shard.reads.close().await;
 }
 
 async fn writer_loop(mut connection: SqliteConnection, mut receiver: mpsc::Receiver<WriteCommand>) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            WriteCommand::Put {
+    const MAX_BATCH: usize = 256;
+    let mut initialized_tables = HashSet::new();
+    while let Some(first) = receiver.recv().await {
+        if let WriteCommand::Shutdown { reply } = first {
+            let _ = reply.send(());
+            break;
+        }
+        let mut batch = vec![first];
+        let mut shutdown_reply = None;
+        while batch.len() < MAX_BATCH {
+            match receiver.try_recv() {
+                Ok(command @ WriteCommand::Put { .. }) => batch.push(command),
+                Ok(WriteCommand::Shutdown { reply }) => {
+                    shutdown_reply = Some(reply);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let result = write_tile_batch(&mut connection, &batch, &initialized_tables).await;
+            if result.is_ok()
+                || attempts >= 4
+                || !result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("database is locked"))
+            {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(2 * attempts)).await;
+        };
+        let (outcomes, batch_tables) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                fail_write_batch(batch, error.to_string());
+                if let Some(reply) = shutdown_reply {
+                    let _ = reply.send(());
+                    break;
+                }
+                continue;
+            }
+        };
+        initialized_tables.extend(batch_tables);
+        if outcomes.len() != batch.len() {
+            fail_write_batch(batch, "incomplete tile write batch".to_owned());
+            if let Some(reply) = shutdown_reply {
+                let _ = reply.send(());
+                break;
+            }
+            continue;
+        }
+        for (command, outcome) in batch.into_iter().zip(outcomes) {
+            if let WriteCommand::Put { reply, .. } = command {
+                let _ = reply.send(Ok(outcome));
+            }
+        }
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(());
+            break;
+        }
+    }
+    let _ = connection.close().await;
+}
+
+async fn write_tile_batch(
+    connection: &mut SqliteConnection,
+    batch: &[WriteCommand],
+    initialized_tables: &HashSet<String>,
+) -> Result<(Vec<PutOutcome>, Vec<String>)> {
+    let mut transaction = connection.begin().await?;
+    let result = async {
+        let mut outcomes = Vec::with_capacity(batch.len());
+        let mut batch_tables = Vec::new();
+        for command in batch {
+            let WriteCommand::Put {
                 table,
                 id,
                 x,
                 y,
                 data,
-                reply,
-            } => {
-                let result = async {
-                    let table = quote_identifier(&table)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                    sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {table}(ID INTEGER NOT NULL PRIMARY KEY,Data BLOB,X INTEGER,Y INTEGER,F INTEGER)"))
-                        .execute(&mut connection)
-                        .await?;
-                    sqlx::query(&format!("CREATE UNIQUE INDEX IF NOT EXISTS IDX_{} ON {table}(ID ASC)", table.trim_matches('"')))
-                        .execute(&mut connection)
-                        .await?;
-                    sqlx::query(&format!("INSERT INTO {table}(ID,Data,X,Y,F) VALUES(?,?,?,?,?) ON CONFLICT(ID) DO UPDATE SET Data=excluded.Data,X=excluded.X,Y=excluded.Y,F=excluded.F"))
-                        .bind(id)
-                        .bind(&data)
-                        .bind(x)
-                        .bind(y)
-                        .bind(data.len() as i64)
-                        .execute(&mut connection)
-                        .await?;
-                    Result::<()>::Ok(())
-                }
-                .await;
-                let _ = reply.send(result);
+                ..
+            } = command
+            else {
+                continue;
+            };
+            let quoted = quote_identifier(table).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            if !initialized_tables.contains(table) && !batch_tables.contains(table) {
+                sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {quoted}(ID INTEGER NOT NULL PRIMARY KEY,Data BLOB,X INTEGER,Y INTEGER,F INTEGER)"))
+                    .execute(&mut *transaction).await?;
+                sqlx::query(&format!("CREATE UNIQUE INDEX IF NOT EXISTS IDX_{} ON {quoted}(ID ASC)", quoted.trim_matches('"')))
+                    .execute(&mut *transaction).await?;
+                batch_tables.push(table.clone());
             }
-            WriteCommand::Shutdown { reply } => {
-                let _ = reply.send(());
-                break;
+            let inserted = sqlx::query(&format!("INSERT OR IGNORE INTO {quoted}(ID,Data,X,Y,F) VALUES(?,?,?,?,?)"))
+                .bind(id).bind(data).bind(x).bind(y).bind(data.len() as i64)
+                .execute(&mut *transaction).await?.rows_affected() > 0;
+            if !inserted {
+                sqlx::query(&format!("UPDATE {quoted} SET Data=?,X=?,Y=?,F=? WHERE ID=?"))
+                    .bind(data).bind(x).bind(y).bind(data.len() as i64).bind(id)
+                    .execute(&mut *transaction).await?;
             }
+            outcomes.push(PutOutcome {
+                created: inserted,
+                requires_recalculation: !inserted,
+            });
+        }
+        Result::<_>::Ok((outcomes, batch_tables))
+    }
+    .await;
+    match result {
+        Ok(result) => {
+            transaction.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
         }
     }
-    let _ = connection.close().await;
+}
+
+fn fail_write_batch(batch: Vec<WriteCommand>, message: String) {
+    for command in batch {
+        if let WriteCommand::Put { reply, .. } = command {
+            let _ = reply.send(Err(anyhow::anyhow!(message.clone())));
+        }
+    }
 }
 
 fn tile_address(root: &Path, key: &TileKey) -> Result<TileAddress, ApiError> {
@@ -415,6 +649,37 @@ fn zoom_letter(zoom: i64) -> Result<char, ApiError> {
         ));
     }
     Ok((b'A' + zoom as u8) as char)
+}
+
+fn table_zoom(table: &str) -> Option<i64> {
+    let first = table.as_bytes().first().copied()?;
+    (first.is_ascii_uppercase()).then_some((first - b'A') as i64)
+}
+
+fn merge_min(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn merge_max(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn tile_format(data: &[u8]) -> &'static str {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "pbf"
+    }
 }
 
 async fn table_exists(pool: &SqlitePool, table: &str) -> Result<bool, sqlx::Error> {
@@ -461,9 +726,13 @@ async fn add_database_info(
     let bytes = directory_size(directory).await?;
     result.push(DatabaseInfo {
         database,
+        name: String::new(),
         path: directory.to_string_lossy().into_owned(),
         bytes,
         modified_at: metadata.modified().ok().and_then(epoch_seconds),
+        tile_count: 0,
+        layer_count: 0,
+        revocable: true,
     });
     Ok(())
 }
@@ -628,6 +897,42 @@ mod tests {
         let tilesets = store.tilesets(database).await.unwrap();
         assert_eq!(tilesets[0].item, item);
         assert_eq!(tilesets[0].tile_count, 1);
+        assert_eq!(tilesets[0].format, "pbf");
+        assert_eq!(tilesets[0].min_zoom, Some(10));
+        assert_eq!(tilesets[0].max_zoom, Some(10));
+        assert_eq!(tilesets[0].min_x, Some(805));
+        assert_eq!(tilesets[0].max_x, Some(805));
+        assert_eq!(tilesets[0].min_y, Some(418));
+        assert_eq!(tilesets[0].max_y, Some(418));
+    }
+
+    #[test]
+    fn detects_preview_tile_formats() {
+        assert_eq!(tile_format(b"\x89PNG\r\n\x1a\nrest"), "png");
+        assert_eq!(tile_format(b"\xff\xd8\xffrest"), "jpg");
+        assert_eq!(tile_format(b"RIFF1234WEBPrest"), "webp");
+        assert_eq!(tile_format(b"\x1a\x03mvt"), "pbf");
+    }
+
+    #[tokio::test]
+    async fn closes_idle_shard_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TileStore::open(dir.path(), 2, 16).await.unwrap();
+        store
+            .put(key("database", "item", 10, 805, 418), vec![1])
+            .await
+            .unwrap();
+        assert_eq!(store.inner.shards.read().await.len(), 1);
+
+        assert_eq!(store.close_idle_shards(Duration::ZERO).await, 1);
+        assert!(store.inner.shards.read().await.is_empty());
+        assert_eq!(
+            store
+                .get(key("database", "item", 10, 805, 418))
+                .await
+                .unwrap(),
+            Some(vec![1])
+        );
     }
 
     #[tokio::test]

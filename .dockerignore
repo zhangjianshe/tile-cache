@@ -2,5 +2,6 @@ target
 .git
 .idea
 data
+tiledata
+config
 *.db*
-

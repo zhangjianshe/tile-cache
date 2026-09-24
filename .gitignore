@@ -1,7 +1,8 @@
 /target
 /data
+/tiledata
+/config
 /.idea
 *.db
 *.db-shm
 *.db-wal
-

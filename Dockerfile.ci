@@ -9,4 +9,5 @@ USER app
 WORKDIR /app
 VOLUME ["/app/tiledata", "/app/config"]
 EXPOSE 7601
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD ["tile-cache", "healthcheck"]
 ENTRYPOINT ["tile-cache"]

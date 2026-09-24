@@ -1,11 +1,13 @@
 [package]
 name = "tile-cache"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Centralized SQLite-backed tile cache service"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = { version = "0.5", features = ["std"] }
+base64 = "0.22"
 axum = { version = "0.8", features = ["http2"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -15,6 +17,7 @@ tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "
 tower-http = { version = "0.6", features = ["limit", "request-id", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.13"
