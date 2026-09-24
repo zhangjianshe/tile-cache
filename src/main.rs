@@ -12,7 +12,7 @@ use api::AppState;
 use catalog::Catalog;
 use clap::Parser;
 use config::{Command, Config};
-use model::{CleanupRun, CleanupSettings};
+use model::{CatalogRebuildStatus, CleanupRun, CleanupSettings};
 use stats::AccessStats;
 use std::{
     io::{Read, Write},
@@ -257,6 +257,7 @@ async fn run(config: Config) -> Result<()> {
         cleanup_settings,
         auth,
         secure_cookies: config.secure_cookies,
+        catalog_rebuild: Arc::new(std::sync::RwLock::new(CatalogRebuildStatus::default())),
     };
     let app = api::router(state, config.max_tile_bytes);
     let listener = tokio::net::TcpListener::bind(config.addr).await?;

@@ -114,13 +114,38 @@ impl Catalog {
     }
 
     pub async fn rebuild(&self, store: &TileStore) -> Result<(usize, usize), ApiError> {
+        self.rebuild_with_progress(store, |_, _, _, _| {}).await
+    }
+
+    pub async fn rebuild_with_progress<F>(
+        &self,
+        store: &TileStore,
+        mut progress: F,
+    ) -> Result<(usize, usize), ApiError>
+    where
+        F: FnMut(usize, usize, usize, usize),
+    {
         self.flush_pending().await.map_err(ApiError::Internal)?;
         let _guard = self.write_lock.lock().await;
         let databases = store.list_databases().await?;
+        let total_databases = databases.len();
+        let mut total_layers = 0;
+        for database in &databases {
+            total_layers += store.tileset_count(&database.database).await?;
+        }
+        progress(0, total_databases, 0, total_layers);
         let mut scanned = Vec::with_capacity(databases.len());
+        let mut processed_layers = 0;
         for database in databases {
             let layers = store.tilesets(&database.database).await?;
+            processed_layers += layers.len();
             scanned.push((database, layers));
+            progress(
+                scanned.len(),
+                total_databases,
+                processed_layers,
+                total_layers,
+            );
         }
         let old_databases =
             sqlx::query("SELECT database_id,display_name,revocable FROM cache_databases")

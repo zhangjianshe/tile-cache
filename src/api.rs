@@ -3,8 +3,8 @@ use crate::{
     catalog::Catalog,
     error::ApiError,
     model::{
-        CleanupResponse, CleanupRun, CleanupSettings, CleanupSettingsResponse, DashboardData,
-        DeleteResponse, HealthResponse, NewCleanupHistory,
+        CatalogRebuildStatus, CleanupResponse, CleanupRun, CleanupSettings,
+        CleanupSettingsResponse, DashboardData, DeleteResponse, HealthResponse, NewCleanupHistory,
     },
     stats::AccessStats,
     store::{TileKey, TileStore},
@@ -22,7 +22,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
     time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
@@ -41,6 +41,7 @@ pub struct AppState {
     pub cleanup_settings: Arc<RwLock<CleanupSettings>>,
     pub auth: SharedAuth,
     pub secure_cookies: bool,
+    pub catalog_rebuild: Arc<StdRwLock<CatalogRebuildStatus>>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +113,7 @@ pub fn router(state: AppState, max_tile_bytes: usize) -> Router {
         .route("/api/v1/dashboard", get(dashboard_data))
         .route("/api/v1/admin/settings", get(cleanup_settings))
         .route("/api/v1/admin/cleanup/history", get(cleanup_history))
+        .route("/api/v1/admin/catalog/rebuild", get(catalog_rebuild_status))
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
@@ -668,11 +670,73 @@ async fn set_tileset_revocable(
 
 async fn rebuild_catalog(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let (databases, layers) = state.catalog.rebuild(&state.store).await?;
-    Ok(Json(
-        serde_json::json!({"databases":databases,"layers":layers}),
-    ))
+) -> Result<(StatusCode, Json<CatalogRebuildStatus>), ApiError> {
+    let initial = {
+        let mut status = state
+            .catalog_rebuild
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if status.running {
+            return Ok((StatusCode::OK, Json(status.clone())));
+        }
+        *status = CatalogRebuildStatus {
+            running: true,
+            phase: "discovering".to_owned(),
+            started_at: Some(epoch_seconds()),
+            ..CatalogRebuildStatus::default()
+        };
+        status.clone()
+    };
+    let catalog = state.catalog.clone();
+    let store = state.store.clone();
+    let rebuild_status = state.catalog_rebuild.clone();
+    tokio::spawn(async move {
+        let progress_status = rebuild_status.clone();
+        let result = catalog
+            .rebuild_with_progress(
+                &store,
+                move |databases, total_databases, layers, total_layers| {
+                    let mut status = progress_status
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner());
+                    status.phase = "scanning".to_owned();
+                    status.processed_databases = databases;
+                    status.total_databases = total_databases;
+                    status.processed_layers = layers;
+                    status.total_layers = total_layers;
+                },
+            )
+            .await;
+        let mut status = rebuild_status
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        status.running = false;
+        status.completed_at = Some(epoch_seconds());
+        match result {
+            Ok((databases, layers)) => {
+                status.phase = "completed".to_owned();
+                status.processed_databases = databases;
+                status.total_databases = databases;
+                status.processed_layers = layers;
+                status.total_layers = layers;
+            }
+            Err(error) => {
+                status.phase = "failed".to_owned();
+                status.error = Some(format!("{error:?}"));
+            }
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(initial)))
+}
+
+async fn catalog_rebuild_status(State(state): State<AppState>) -> Json<CatalogRebuildStatus> {
+    Json(
+        state
+            .catalog_rebuild
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone(),
+    )
 }
 
 fn valid_display_name(name: String) -> Result<String, ApiError> {
@@ -1009,6 +1073,71 @@ mod tests {
         assert!(html.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
         assert!(!html.contains("__TILE_CACHE_VERSION__"));
         assert!(!html.contains("Storage service"));
+        assert!(html.contains("id=\"rebuildCatalog\""));
+    }
+
+    #[tokio::test]
+    async fn catalog_rebuild_runs_in_background_and_rejects_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TileStore::open(&temp.path().join("tiles"), 1, 8)
+            .await
+            .unwrap();
+        store
+            .put(
+                TileKey {
+                    database: "database".to_owned(),
+                    item: "layer".to_owned(),
+                    z: 1,
+                    x: 1,
+                    y: 1,
+                    tile_type: None,
+                },
+                vec![1, 2, 3],
+            )
+            .await
+            .unwrap();
+        let catalog = Catalog::open(&temp.path().join("config"), store.clone())
+            .await
+            .unwrap();
+        let state = AppState {
+            store,
+            catalog,
+            auth_token: Arc::from(""),
+            stats: AccessStats::open(&temp.path().join("config"))
+                .await
+                .unwrap(),
+            cleanup_settings: Arc::new(RwLock::new(CleanupSettings {
+                retention_days: 7,
+                cleanup_hour: 4,
+                shard_idle_seconds: 300,
+            })),
+            auth: Arc::new(
+                crate::auth::AuthService::open(&temp.path().join("config"))
+                    .await
+                    .unwrap(),
+            ),
+            secure_cookies: false,
+            catalog_rebuild: Arc::new(StdRwLock::new(CatalogRebuildStatus::default())),
+        };
+
+        let (status, first) = rebuild_catalog(State(state.clone())).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(first.running);
+        let (status, second) = rebuild_catalog(State(state.clone())).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(second.running);
+
+        for _ in 0..100 {
+            let current = catalog_rebuild_status(State(state.clone())).await.0;
+            if !current.running {
+                assert_eq!(current.phase, "completed");
+                assert_eq!(current.total_databases, 1);
+                assert_eq!(current.total_layers, 1);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("catalog rebuild did not complete");
     }
 
     #[tokio::test]
@@ -1037,6 +1166,7 @@ mod tests {
                     .unwrap(),
             ),
             secure_cookies: false,
+            catalog_rebuild: Arc::new(StdRwLock::new(CatalogRebuildStatus::default())),
         };
         let app = router(state, 1024);
 
@@ -1135,6 +1265,7 @@ mod tests {
                     .unwrap(),
             ),
             secure_cookies: false,
+            catalog_rebuild: Arc::new(StdRwLock::new(CatalogRebuildStatus::default())),
         };
         let response = router(state, 1024)
             .oneshot(
@@ -1175,6 +1306,7 @@ mod tests {
                     .unwrap(),
             ),
             secure_cookies: false,
+            catalog_rebuild: Arc::new(StdRwLock::new(CatalogRebuildStatus::default())),
         };
         let app = router(state, 4 * 1024 * 1024);
         let database = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

@@ -477,6 +477,32 @@ impl TileStore {
         Ok(result)
     }
 
+    pub async fn tileset_count(&self, database_id: &str) -> Result<usize, ApiError> {
+        let database_dir = database_directory(&self.inner.root, database_id)?;
+        if tokio::fs::metadata(&database_dir).await.is_err() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let mut prefixes = tokio::fs::read_dir(&database_dir).await?;
+        while let Some(prefix) = prefixes.next_entry().await? {
+            if !prefix.file_type().await?.is_dir() {
+                continue;
+            }
+            let prefix_name = component(&prefix.path());
+            let mut items = tokio::fs::read_dir(prefix.path()).await?;
+            while let Some(item) = items.next_entry().await? {
+                if !item.file_type().await?.is_dir() {
+                    continue;
+                }
+                let item_id = format!("{}{}", prefix_name, component(&item.path()));
+                if validate_id("item", &item_id).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub async fn drop_tileset(&self, database_id: &str, item: &str) -> Result<u64, ApiError> {
         validate_id("database", database_id)?;
         validate_id("item", item)?;

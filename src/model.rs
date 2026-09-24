@@ -78,6 +78,35 @@ pub struct CleanupSettingsResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct CatalogRebuildStatus {
+    pub running: bool,
+    pub phase: String,
+    pub processed_databases: usize,
+    pub total_databases: usize,
+    pub processed_layers: usize,
+    pub total_layers: usize,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl Default for CatalogRebuildStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            phase: "idle".to_owned(),
+            processed_databases: 0,
+            total_databases: 0,
+            processed_layers: 0,
+            total_layers: 0,
+            started_at: None,
+            completed_at: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct CleanupHistoryEntry {
     pub id: i64,
     pub completed_at: u64,
