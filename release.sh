@@ -6,7 +6,10 @@ current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
 IFS=. read -r major minor patch <<< "$current"
 next="$major.$minor.$((patch + 1))"
 sed -i "0,/^version = \"$current\"/s//version = \"$next\"/" Cargo.toml
-cargo check --locked || cargo check
+# The package version is part of Cargo.lock. Allow this first command to
+# synchronize the root package entry after Cargo.toml has been bumped; every
+# subsequent build step remains locked and reproducible.
+cargo check
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
