@@ -16,6 +16,7 @@
 - 数据库与图层的分页、名称/ID 查询、显示名称修改和物理删除
 - 数据库与图层独立的自动回收保护，默认允许回收
 - 自动清理长期未访问缓存，并保留最近 90 天的逐项清理历史
+- 进程内按字节计量的瓦片 LRU，减少热点瓦片反复读取 SQLite 和磁盘
 - 内置运行概览、缓存数据预览和清理策略 Dashboard
 - OpenLayers 资源内置，支持完全离线的数据预览
 - GET 公开，写入与管理 API 支持 Bearer Token；Dashboard 支持管理员会话
@@ -53,6 +54,8 @@ Dashboard 包含三个功能区：
 数据库与图层目录保存在实例管理库 `config/tile-cache-meta.db`。列表、Dashboard 和数据预览直接查询管理表，不会在每次访问时扫描 `.s` 分片；瓦片 PUT、图层删除和数据库删除会增量维护数量、容量、层级、范围、回收策略及更新时间。升级已有数据时首次启动会自动建立目录，管理员也可通过重建接口手动校准；重建会保留显示名称和回收保护状态。
 
 PUT 在瓦片分片提交成功后即返回，目录增量通过容量为 65,536 的有界队列在内存中按数据库和图层合并，每 60 秒批量写入；队列满时生产者会等待而不会丢失统计。Dashboard 的数量、容量和范围因此最多延迟约一分钟，但管理 SQLite 的抖动不会把已经成功写入的瓦片误报为失败。重命名、回收策略和删除等管理操作会先强制刷新待处理目录增量，避免操作到过期记录。
+
+GET 在访问 SQLite 前会查询进程内瓦片 LRU。LRU 按瓦片实际字节数限制容量，缺省为 512 MiB；PUT 成功后直接写入缓存，覆盖、删除图层或删除数据库时同步失效相关条目。404/空瓦片不会进入缓存，单块超过 2 MiB 的瓦片缺省不进入 LRU，避免少数异常大对象挤出热点数据。该缓存是每个实例独立的性能缓存，不影响共享瓦片数据库的一致性；设置 `TILE_CACHE_MEMORY_CACHE_BYTES=0` 可关闭。
 
 瓦片写入不预查询旧记录：先执行 `INSERT OR IGNORE`，键冲突时直接 `UPDATE` 覆盖。新增瓦片可以直接增量统计；发生覆盖的图层会在下一次分钟级目录刷新时从分片重新汇总数量和容量，保证 Dashboard 最终准确而不阻塞 PUT 主路径。
 
@@ -241,6 +244,8 @@ sudo chown -R 10001:10001 ./tiledata ./config
 | `TILE_CACHE_SECURE_COOKIES` | `false` | 通过 HTTPS 反向代理提供 Dashboard 时设为 `true`，为会话 Cookie 增加 `Secure` |
 | `TILE_CACHE_ADMIN_PASSWORD` | 空 | Dashboard 管理员初始密码；仅在管理员不存在时使用，未设置则随机生成 |
 | `TILE_CACHE_MAX_TILE_BYTES` | `33554432` | 单瓦片最大字节数 |
+| `TILE_CACHE_MEMORY_CACHE_BYTES` | `536870912` | 进程内瓦片 LRU 容量（字节），即 512 MiB；`0` 禁用 |
+| `TILE_CACHE_MEMORY_CACHE_MAX_TILE_BYTES` | `2097152` | 允许进入 LRU 的单瓦片最大字节数，即 2 MiB |
 | `TILE_CACHE_WRITE_QUEUE` | `4096` | 有界写队列容量 |
 | `TILE_CACHE_READ_CONNECTIONS` | `4` | 每个已打开分片的 SQLite 最大读连接数 |
 | `TILE_CACHE_SHARD_IDLE_SECONDS` | `300` | 分片无请求后关闭连接的时间；每分钟检查一次，`0` 禁用 |

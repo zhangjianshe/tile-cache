@@ -51,6 +51,22 @@ pub struct Config {
     #[arg(long, env = "TILE_CACHE_MAX_TILE_BYTES", default_value_t = 33_554_432)]
     pub max_tile_bytes: usize,
 
+    /// Maximum in-memory tile LRU size in bytes. Zero disables it.
+    #[arg(
+        long,
+        env = "TILE_CACHE_MEMORY_CACHE_BYTES",
+        default_value_t = 536_870_912
+    )]
+    pub memory_cache_bytes: usize,
+
+    /// Do not admit a single tile larger than this many bytes into the memory LRU.
+    #[arg(
+        long,
+        env = "TILE_CACHE_MEMORY_CACHE_MAX_TILE_BYTES",
+        default_value_t = 2_097_152
+    )]
+    pub memory_cache_max_tile_bytes: usize,
+
     /// Bounded write queue capacity; overload is rejected with HTTP 503.
     #[arg(long, env = "TILE_CACHE_WRITE_QUEUE", default_value_t = 4096)]
     pub write_queue: usize,

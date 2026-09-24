@@ -116,5 +116,6 @@ pub struct DashboardData {
     pub disk_bytes: u64,
     pub memory_bytes: u64,
     pub thread_count: u64,
+    pub tile_memory_cache: crate::store::MemoryCacheMetrics,
     pub hourly: Vec<HourStats>,
 }

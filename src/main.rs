@@ -87,6 +87,8 @@ async fn run(config: Config) -> Result<()> {
          ├─ cleanup hour    : {:02}:00 Asia/Shanghai\n\
          ├─ write queue      : {}\n\
          ├─ max tile size    : {} bytes ({:.2} MiB)\n\
+         ├─ memory tile LRU  : {} bytes ({:.2} MiB)\n\
+         ├─ LRU max tile     : {} bytes ({:.2} MiB)\n\
          └─ retention days   : {}",
         config.addr,
         config.root_dir.display(),
@@ -104,12 +106,18 @@ async fn run(config: Config) -> Result<()> {
         config.write_queue.max(1),
         config.max_tile_bytes,
         config.max_tile_bytes as f64 / 1_048_576.0,
+        config.memory_cache_bytes,
+        config.memory_cache_bytes as f64 / 1_048_576.0,
+        config.memory_cache_max_tile_bytes,
+        config.memory_cache_max_tile_bytes as f64 / 1_048_576.0,
         config.retention_days,
     );
-    let store = TileStore::open(
+    let store = TileStore::open_with_cache(
         &config.root_dir,
         config.read_connections,
         config.write_queue,
+        config.memory_cache_bytes,
+        config.memory_cache_max_tile_bytes,
     )
     .await?;
     let stats = AccessStats::open(&config.config_dir).await?;

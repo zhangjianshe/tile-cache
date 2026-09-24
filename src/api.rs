@@ -469,6 +469,7 @@ async fn dashboard_data(State(state): State<AppState>) -> Result<Json<DashboardD
         disk_bytes,
         memory_bytes: process.memory_bytes,
         thread_count: process.thread_count,
+        tile_memory_cache: state.store.memory_cache_metrics(),
         hourly: state.stats.recent(24),
     }))
 }

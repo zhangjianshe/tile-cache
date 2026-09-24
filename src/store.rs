@@ -3,15 +3,20 @@ use crate::{
     model::{DatabaseInfo, TilesetInfo},
 };
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Connection, Row, SqliteConnection, SqlitePool,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -30,6 +35,7 @@ struct StoreInner {
     access_touches: Mutex<HashMap<String, SystemTime>>,
     read_connections: u32,
     queue_capacity: usize,
+    memory_cache: TileMemoryCache,
 }
 
 struct Shard {
@@ -38,7 +44,7 @@ struct Shard {
     last_used: std::sync::Mutex<Instant>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TileKey {
     pub database: String,
     pub item: String,
@@ -46,6 +52,154 @@ pub struct TileKey {
     pub x: i64,
     pub y: i64,
     pub tile_type: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MemoryCacheMetrics {
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+struct TileMemoryCache {
+    capacity: usize,
+    max_tile_bytes: usize,
+    clock: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    inner: std::sync::Mutex<MemoryCacheInner>,
+}
+
+#[derive(Default)]
+struct MemoryCacheInner {
+    entries: HashMap<TileKey, MemoryCacheEntry>,
+    order: BinaryHeap<Reverse<(u64, TileKey)>>,
+    used_bytes: usize,
+}
+
+struct MemoryCacheEntry {
+    data: Arc<[u8]>,
+    last_used: u64,
+}
+
+impl TileMemoryCache {
+    fn new(capacity: usize, max_tile_bytes: usize) -> Self {
+        Self {
+            capacity,
+            max_tile_bytes,
+            clock: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            inner: std::sync::Mutex::new(MemoryCacheInner::default()),
+        }
+    }
+
+    fn get(&self, key: &TileKey) -> Option<Arc<[u8]>> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let data = if let Some(entry) = inner.entries.get_mut(key) {
+            entry.last_used = tick;
+            Some(entry.data.clone())
+        } else {
+            None
+        };
+        if data.is_some() {
+            inner.order.push(Reverse((tick, key.clone())));
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        data
+    }
+
+    fn insert(&self, key: TileKey, data: Vec<u8>) {
+        if self.capacity == 0 || data.is_empty() || data.len() > self.max_tile_bytes {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = inner.entries.remove(&key) {
+            inner.used_bytes = inner.used_bytes.saturating_sub(previous.data.len());
+        }
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let data: Arc<[u8]> = data.into();
+        inner.used_bytes = inner.used_bytes.saturating_add(data.len());
+        inner.entries.insert(
+            key.clone(),
+            MemoryCacheEntry {
+                data,
+                last_used: tick,
+            },
+        );
+        inner.order.push(Reverse((tick, key)));
+        while inner.used_bytes > self.capacity {
+            let Some(Reverse((candidate_tick, candidate))) = inner.order.pop() else {
+                break;
+            };
+            let current = inner.entries.get(&candidate).map(|entry| entry.last_used);
+            if current != Some(candidate_tick) {
+                continue;
+            }
+            if let Some(removed) = inner.entries.remove(&candidate) {
+                inner.used_bytes = inner.used_bytes.saturating_sub(removed.data.len());
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if inner.order.len() > inner.entries.len().saturating_mul(4).saturating_add(1024) {
+            inner.order = inner
+                .entries
+                .iter()
+                .map(|(key, entry)| Reverse((entry.last_used, key.clone())))
+                .collect();
+        }
+    }
+
+    fn invalidate_item(&self, database: &str, item: &str) {
+        self.invalidate(|key| key.database == database && key.item == item);
+    }
+
+    fn invalidate_database(&self, database: &str) {
+        self.invalidate(|key| key.database == database);
+    }
+
+    fn invalidate(&self, predicate: impl Fn(&TileKey) -> bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let keys = inner
+            .entries
+            .keys()
+            .filter(|key| predicate(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(entry) = inner.entries.remove(&key) {
+                inner.used_bytes = inner.used_bytes.saturating_sub(entry.data.len());
+            }
+        }
+        inner.order = inner
+            .entries
+            .iter()
+            .map(|(key, entry)| Reverse((entry.last_used, key.clone())))
+            .collect();
+    }
+
+    fn metrics(&self) -> MemoryCacheMetrics {
+        let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        MemoryCacheMetrics {
+            capacity_bytes: self.capacity as u64,
+            used_bytes: inner.used_bytes as u64,
+            entries: inner.entries.len() as u64,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
 }
 
 struct TileAddress {
@@ -77,7 +231,18 @@ enum WriteCommand {
 }
 
 impl TileStore {
+    #[cfg(test)]
     pub async fn open(root: &Path, read_connections: u32, queue_capacity: usize) -> Result<Self> {
+        Self::open_with_cache(root, read_connections, queue_capacity, 0, 0).await
+    }
+
+    pub async fn open_with_cache(
+        root: &Path,
+        read_connections: u32,
+        queue_capacity: usize,
+        memory_cache_bytes: usize,
+        memory_cache_max_tile_bytes: usize,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(root)
             .await
             .with_context(|| format!("create tile database root {}", root.display()))?;
@@ -88,8 +253,13 @@ impl TileStore {
                 access_touches: Mutex::new(HashMap::new()),
                 read_connections: read_connections.max(1),
                 queue_capacity: queue_capacity.max(1),
+                memory_cache: TileMemoryCache::new(memory_cache_bytes, memory_cache_max_tile_bytes),
             }),
         })
+    }
+
+    pub fn memory_cache_metrics(&self) -> MemoryCacheMetrics {
+        self.inner.memory_cache.metrics()
     }
 
     pub fn database_path(&self, database: &str) -> Result<String, ApiError> {
@@ -100,6 +270,9 @@ impl TileStore {
 
     pub async fn get(&self, key: TileKey) -> Result<Option<Vec<u8>>, ApiError> {
         let address = tile_address(&self.inner.root, &key)?;
+        if let Some(data) = self.inner.memory_cache.get(&key) {
+            return Ok(Some(data.as_ref().to_vec()));
+        }
         let Some(shard) = self.shard(&address.shard_file, false).await? else {
             return Ok(None);
         };
@@ -118,6 +291,9 @@ impl TileStore {
             self.touch_database(&key.database, &address.database_dir)
                 .await;
         }
+        if let Some(value) = data.as_ref() {
+            self.inner.memory_cache.insert(key, value.clone());
+        }
         Ok(data)
     }
 
@@ -128,6 +304,7 @@ impl TileStore {
             ));
         }
         let address = tile_address(&self.inner.root, &key)?;
+        let cache_data = data.clone();
         tokio::fs::create_dir_all(&address.item_dir).await?;
         let shard = self
             .shard(&address.shard_file, true)
@@ -152,6 +329,7 @@ impl TileStore {
             .map_err(ApiError::Internal)?;
         self.touch_database(&key.database, &address.database_dir)
             .await;
+        self.inner.memory_cache.insert(key, cache_data);
         Ok(outcome)
     }
 
@@ -302,6 +480,7 @@ impl TileStore {
     pub async fn drop_tileset(&self, database_id: &str, item: &str) -> Result<u64, ApiError> {
         validate_id("database", database_id)?;
         validate_id("item", item)?;
+        self.inner.memory_cache.invalidate_item(database_id, item);
         let item_dir = item_directory(&database_directory(&self.inner.root, database_id)?, item)?;
         if tokio::fs::metadata(&item_dir).await.is_err() {
             return Ok(0);
@@ -313,6 +492,7 @@ impl TileStore {
 
     pub async fn drop_database(&self, database_id: &str) -> Result<u64, ApiError> {
         let database_dir = database_directory(&self.inner.root, database_id)?;
+        self.inner.memory_cache.invalidate_database(database_id);
         if tokio::fs::metadata(&database_dir).await.is_err() {
             return Ok(0);
         }
@@ -912,6 +1092,49 @@ mod tests {
         assert_eq!(tile_format(b"\xff\xd8\xffrest"), "jpg");
         assert_eq!(tile_format(b"RIFF1234WEBPrest"), "webp");
         assert_eq!(tile_format(b"\x1a\x03mvt"), "pbf");
+    }
+
+    #[test]
+    fn memory_cache_is_byte_bounded_and_uses_lru_order() {
+        let cache = TileMemoryCache::new(6, 6);
+        let first = key("database", "first", 1, 1, 1);
+        let second = key("database", "second", 1, 1, 1);
+        let third = key("database", "third", 1, 1, 1);
+
+        cache.insert(first.clone(), vec![1; 3]);
+        cache.insert(second.clone(), vec![2; 3]);
+        assert_eq!(cache.get(&first).as_deref(), Some([1, 1, 1].as_slice()));
+
+        cache.insert(third.clone(), vec![3; 3]);
+        assert!(cache.get(&second).is_none());
+        assert_eq!(cache.get(&first).as_deref(), Some([1, 1, 1].as_slice()));
+        assert_eq!(cache.get(&third).as_deref(), Some([3, 3, 3].as_slice()));
+
+        let metrics = cache.metrics();
+        assert_eq!(metrics.used_bytes, 6);
+        assert_eq!(metrics.entries, 2);
+        assert_eq!(metrics.evictions, 1);
+    }
+
+    #[test]
+    fn memory_cache_skips_large_tiles_and_invalidates_catalog_entries() {
+        let cache = TileMemoryCache::new(32, 4);
+        let protected = key("database", "protected", 1, 1, 1);
+        let removable = key("database", "removable", 1, 1, 1);
+
+        cache.insert(protected.clone(), vec![1; 5]);
+        assert!(cache.get(&protected).is_none());
+
+        cache.insert(protected.clone(), vec![1; 4]);
+        cache.insert(removable.clone(), vec![2; 4]);
+        cache.invalidate_item("database", "removable");
+        assert!(cache.get(&removable).is_none());
+        assert!(cache.get(&protected).is_some());
+
+        cache.invalidate_database("database");
+        assert!(cache.get(&protected).is_none());
+        assert_eq!(cache.metrics().entries, 0);
+        assert_eq!(cache.metrics().used_bytes, 0);
     }
 
     #[tokio::test]
