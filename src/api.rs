@@ -437,8 +437,10 @@ async fn put_tile_batch(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
+async fn dashboard() -> Html<String> {
+    Html(
+        include_str!("dashboard.html").replace("__TILE_CACHE_VERSION__", env!("CARGO_PKG_VERSION")),
+    )
 }
 
 async fn openlayers_js() -> impl IntoResponse {
@@ -998,6 +1000,15 @@ mod tests {
         assert_eq!(parse_y_extension("420.png").unwrap(), (420, "png"));
         assert!(parse_y_extension("420").is_err());
         assert!(parse_y_extension("x.png").is_err());
+    }
+
+    #[tokio::test]
+    async fn dashboard_shows_product_name_and_current_version() {
+        let html = dashboard().await.0;
+        assert!(html.contains("地图缓存服务"));
+        assert!(html.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(!html.contains("__TILE_CACHE_VERSION__"));
+        assert!(!html.contains("Storage service"));
     }
 
     #[tokio::test]
